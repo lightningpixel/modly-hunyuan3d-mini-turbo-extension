@@ -7,7 +7,12 @@
   "version": "1.0.0",
   "author": "Lightning Pixel",
   "generator_class": "Hunyuan3DMiniTurboGenerator",
-  "tags": ["image-to-3d", "turbo", "fast", "low-vram"],
+  "tags": [
+    "image-to-3d",
+    "turbo",
+    "fast",
+    "low-vram"
+  ],
   "nodes": [
     {
       "id": "generate",
@@ -28,9 +33,18 @@
           "type": "select",
           "default": 10,
           "options": [
-            { "value": 5,  "label": "Fast" },
-            { "value": 10, "label": "Balanced" },
-            { "value": 20, "label": "High" }
+            {
+              "value": 5,
+              "label": "Fast"
+            },
+            {
+              "value": 10,
+              "label": "Balanced"
+            },
+            {
+              "value": 20,
+              "label": "High"
+            }
           ],
           "tooltip": "Number of diffusion steps. More steps = better quality but slower."
         },
@@ -40,9 +54,18 @@
           "type": "select",
           "default": 380,
           "options": [
-            { "value": 256, "label": "Low" },
-            { "value": 380, "label": "Medium" },
-            { "value": 512, "label": "High" }
+            {
+              "value": 256,
+              "label": "Low"
+            },
+            {
+              "value": 380,
+              "label": "Medium"
+            },
+            {
+              "value": 512,
+              "label": "High"
+            }
           ],
           "tooltip": "Octree resolution for mesh reconstruction. Higher = more detail but slower and more VRAM."
         },
@@ -51,8 +74,8 @@
           "label": "Guidance Scale",
           "type": "float",
           "default": 5.5,
-          "min": 1.0,
-          "max": 10.0,
+          "min": 1,
+          "max": 10,
           "step": 0.5,
           "tooltip": "Classifier-free guidance strength. Higher = closer to the input image."
         },

@@ -14,12 +14,23 @@ import zipfile
 from pathlib import Path
 from typing import Callable, Optional
 
+# Must be set before the first `import torch` in this process so Metal (MPS)
+# operators without a kernel transparently fall back to CPU instead of raising.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 from PIL import Image
 
-from services.generators.base import BaseGenerator, smooth_progress, GenerationCancelled
+from services.generators.base import (
+    BaseGenerator,
+    smooth_progress,
+    GenerationCancelled,
+    select_device,
+    select_dtype,
+)
 
 _HF_REPO_ID      = "tencent/Hunyuan3D-2mini"
 _SUBFOLDER       = "hunyuan3d-dit-v2-mini-turbo"
+_TURBO_VAE       = "hunyuan3d-vae-v2-mini-turbo"
 _GITHUB_ZIP      = "https://github.com/Tencent/Hunyuan3D-2/archive/refs/heads/main.zip"
 _PAINT_HF_REPO   = "tencent/Hunyuan3D-2"
 _PAINT_SUBFOLDER = "hunyuan3d-paint-v2-0-turbo"
@@ -48,18 +59,13 @@ class Hunyuan3DMiniTurboGenerator(BaseGenerator):
 
         self._ensure_hy3dgen()
 
-        import torch
         from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
 
-        if sys.platform == "darwin":
-            if torch.backends.mps.is_available():
-                device = "mps"
-            else:
-                device = "cpu"
-            dtype = torch.float32  # MPS has limited fp16 op coverage
-        else:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            dtype  = torch.float16 if device == "cuda" else torch.float32
+        device = select_device()
+        dtype  = select_dtype(device)
+        self._device = device
+
+        self._patch_sdp_backend_for_non_cuda(device)
 
         subfolder = self.download_check if self.download_check else _SUBFOLDER
         print(f"[Hunyuan3DMiniTurboGenerator] Loading pipeline from {self.model_dir} (subfolder={subfolder})…")
@@ -70,13 +76,93 @@ class Hunyuan3DMiniTurboGenerator(BaseGenerator):
             device=device,
             dtype=dtype,
         )
+
+        self._enable_flashvdm(pipeline, device, dtype)
+
         self._model = pipeline
         print(f"[Hunyuan3DMiniTurboGenerator] Loaded on {device}.")
+
+    @staticmethod
+    def _patch_sdp_backend_for_non_cuda(device: str) -> None:
+        """Neutralise hy3dgen's CUDA-only `torch.backends.cuda.sdp_kernel(...)`.
+
+        The DiT blocks request `enable_flash=True, enable_math=False` which is
+        only satisfiable on CUDA. On MPS/CPU there is no fused kernel, so
+        forbidding the math backend makes SDPA raise "No available kernel".
+        """
+        if device == "cuda":
+            return
+        import contextlib
+        import torch
+
+        if getattr(torch.backends.cuda, "_modly_sdp_patched", False):
+            return
+
+        @contextlib.contextmanager
+        def _sdpa_kernel(**_kwargs):
+            yield
+
+        try:
+            torch.backends.cuda._modly_sdp_original = torch.backends.cuda.sdp_kernel
+            torch.backends.cuda.sdp_kernel = _sdpa_kernel
+            torch.backends.cuda._modly_sdp_patched = True
+            print("[Hunyuan3DMiniTurboGenerator] Relaxed sdp_kernel for non-CUDA device.")
+        except Exception as exc:
+            print(f"[Hunyuan3DMiniTurboGenerator] Could not relax sdp_kernel: {exc}")
+
+    @staticmethod
+    def _unpatch_sdp_backend() -> None:
+        """Restore `torch.backends.cuda.sdp_kernel` if this generator patched it.
+
+        Scopes the patch to this generator's loaded lifetime so it doesn't
+        silently neuter kernel selection for other CUDA models running in the
+        same process after this generator unloads.
+        """
+        import torch
+
+        original = getattr(torch.backends.cuda, "_modly_sdp_original", None)
+        if original is not None:
+            torch.backends.cuda.sdp_kernel = original
+            del torch.backends.cuda._modly_sdp_original
+        if getattr(torch.backends.cuda, "_modly_sdp_patched", False):
+            torch.backends.cuda._modly_sdp_patched = False
+
+    def _enable_flashvdm(self, pipeline, device: str, dtype) -> None:
+        """Enable FlashVDM: the adaptive-KV volume decoder used by the turbo model.
+
+        The turbo checkpoint embeds the standard mini VAE, so the dedicated
+        turbo VAE is swapped in before enabling the decoder. Surface extraction
+        uses marching cubes ('mc'); the DMC extractor depends on the CUDA-only
+        `diso` package and has no Metal (MPS) or CPU backend.
+        """
+        try:
+            from hy3dgen.shapegen.models import ShapeVAE
+
+            vae_dir = self.model_dir / _TURBO_VAE
+            if vae_dir.exists():
+                pipeline.vae = ShapeVAE.from_pretrained(
+                    str(self.model_dir),
+                    subfolder=_TURBO_VAE,
+                    use_safetensors=True,
+                    device=device,
+                    dtype=dtype,
+                )
+
+            pipeline.vae.enable_flashvdm_decoder(
+                enabled=True,
+                adaptive_kv_selection=True,
+                topk_mode="mean",
+                mc_algo="mc",
+            )
+            print("[Hunyuan3DMiniTurboGenerator] FlashVDM decoder enabled (mc surface extraction).")
+        except Exception as exc:
+            print(f"[Hunyuan3DMiniTurboGenerator] FlashVDM unavailable ({exc}); using vanilla decoder.")
 
     def unload(self) -> None:
         super().unload()
         try:
             import torch
+            self._unpatch_sdp_backend()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             elif torch.backends.mps.is_available():
@@ -179,6 +265,13 @@ class Hunyuan3DMiniTurboGenerator(BaseGenerator):
 
     def _run_texture(self, mesh, image: "Image.Image", progress_cb=None):
         import torch
+
+        if getattr(self, "_device", None) != "cuda":
+            raise RuntimeError(
+                "Texture generation requires an NVIDIA GPU: the custom rasterizer / "
+                "differentiable renderer have no Metal (MPS) or CPU implementation. "
+                "Disable the texture option on macOS."
+            )
 
         self._check_texgen_extensions()
 
