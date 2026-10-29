@@ -4,7 +4,7 @@
   "type": "model",
   "source": "https://github.com/lightningpixel/modly-hunyuan3d-mini-turbo-extension",
   "description": "Ultra-fast turbo variant of Hunyuan3D 2 Mini. High-quality results in 1–5 steps.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Lightning Pixel",
   "generator_class": "Hunyuan3DMiniTurboGenerator",
   "tags": [
